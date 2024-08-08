@@ -23,6 +23,9 @@ class ListingKey(arc4.Struct):
 class ListingValue(arc4.Struct):
     deposited: arc4.UInt64
     unitary_price: arc4.UInt64
+    bidder: arc4.Address
+    bid: arc4.UInt64
+    bid_unitary_price: arc4.UInt64
 
 
 class DigitalMarketplace(ARC4Contract):
@@ -39,11 +42,27 @@ class DigitalMarketplace(ARC4Contract):
                 self.listings.key_prefix.length +
                 32 + 8 + 8 +
                 # Value length
-                8 + 8
+                8 + 8 + 32 + 8 + 8
                 # fmt: on
             )
             * 400
         )
+
+    @subroutine
+    def quantity_price(
+        self, quantity: UInt64, price: UInt64, asset_decimals: UInt64
+    ) -> UInt64:
+        amount_not_scaled_high, amount_not_scaled_low = op.mulw(price, quantity)
+        scaling_factor_high, scaling_factor_low = op.expw(10, asset_decimals)
+        _quotient_high, amount_to_be_paid, _remainder_high, _remainder_low = op.divmodw(
+            amount_not_scaled_high,
+            amount_not_scaled_low,
+            scaling_factor_high,
+            scaling_factor_low,
+        )
+        assert not _quotient_high
+
+        return amount_to_be_paid
 
     @abimethod(readonly=True)
     def get_listings_mbr(self) -> UInt64:
@@ -86,7 +105,11 @@ class DigitalMarketplace(ARC4Contract):
         assert xfer.asset_amount > 0
 
         self.listings[key] = ListingValue(
-            deposited=arc4.UInt64(xfer.asset_amount), unitary_price=unitary_price
+            deposited=arc4.UInt64(xfer.asset_amount),
+            unitary_price=unitary_price,
+            bidder=arc4.Address(),
+            bid=arc4.UInt64(),
+            bid_unitary_price=arc4.UInt64(),
         )
 
     @abimethod
@@ -134,17 +157,9 @@ class DigitalMarketplace(ARC4Contract):
 
         listing = self.listings[key].copy()
 
-        amount_not_scaled_high, amount_not_scaled_low = op.mulw(
-            listing.unitary_price.native, quantity
+        amount_to_be_paid = self.quantity_price(
+            quantity, listing.unitary_price.native, asset.decimals
         )
-        scaling_factor_high, scaling_factor_low = op.expw(10, asset.decimals)
-        _quotient_high, amount_to_be_paid, _remainder_high, _remainder_low = op.divmodw(
-            amount_not_scaled_high,
-            amount_not_scaled_low,
-            scaling_factor_high,
-            scaling_factor_low,
-        )
-        assert not _quotient_high
 
         assert buy_pay.sender == Txn.sender
         assert buy_pay.receiver.bytes == owner.bytes
@@ -167,6 +182,15 @@ class DigitalMarketplace(ARC4Contract):
         )
 
         listing = self.listings[key].copy()
+        if listing.bidder != arc4.Address():
+            current_bid_deposit = self.quantity_price(
+                listing.bid.native,
+                listing.bid_unitary_price.native,
+                asset.decimals,
+            )
+            itxn.Payment(
+                receiver=listing.bidder.native, amount=current_bid_deposit
+            ).submit()
 
         del self.listings[key]
 
@@ -177,3 +201,70 @@ class DigitalMarketplace(ARC4Contract):
             asset_receiver=Txn.sender,
             asset_amount=listing.deposited.native,
         ).submit()
+
+    @abimethod
+    def bid(
+        self,
+        owner: arc4.Address,
+        asset: Asset,
+        nonce: arc4.UInt64,
+        bid_pay: gtxn.PaymentTransaction,
+        quantity: arc4.UInt64,
+        unitary_price: arc4.UInt64,
+    ) -> None:
+        key = ListingKey(owner, arc4.UInt64(asset.id), nonce)
+
+        listing = self.listings[key].copy()
+        if listing.bidder != arc4.Address():
+            assert unitary_price > listing.bid_unitary_price
+
+            current_bid_amount = self.quantity_price(
+                listing.bid.native, listing.bid_unitary_price.native, asset.decimals
+            )
+
+            itxn.Payment(
+                receiver=listing.bidder.native, amount=current_bid_amount
+            ).submit()
+
+        amount_to_be_bid = self.quantity_price(
+            quantity.native, unitary_price.native, asset.decimals
+        )
+
+        assert bid_pay.sender == Txn.sender
+        assert bid_pay.receiver == Global.current_application_address
+        assert bid_pay.amount == amount_to_be_bid
+
+        self.listings[key].bidder = arc4.Address(Txn.sender)
+        self.listings[key].bid = quantity
+        self.listings[key].bid_unitary_price = unitary_price
+
+    @abimethod
+    def accept_bid(self, asset: Asset, nonce: arc4.UInt64) -> None:
+        key = ListingKey(arc4.Address(Txn.sender), arc4.UInt64(asset.id), nonce)
+
+        listing = self.listings[key].copy()
+        assert listing.bidder != arc4.Address()
+
+        min_quantity = (
+            listing.deposited.native
+            if listing.deposited.native < listing.bid.native
+            else listing.bid.native
+        )
+        best_bid_amount = self.quantity_price(
+            min_quantity, listing.bid_unitary_price.native, asset.decimals
+        )
+
+        itxn.Payment(receiver=Txn.sender, amount=best_bid_amount).submit()
+
+        itxn.AssetTransfer(
+            xfer_asset=asset,
+            asset_receiver=listing.bidder.native,
+            asset_amount=min_quantity,
+        ).submit()
+
+        self.listings[key].deposited = arc4.UInt64(
+            self.listings[key].deposited.native - min_quantity
+        )
+        self.listings[key].bid = arc4.UInt64(
+            self.listings[key].bid.native - min_quantity
+        )
